@@ -1,0 +1,10 @@
+[project]
+name = "cs336"
+version = "0.1.0"
+description = "standford cs336"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4.4",
+    "torch>=2.11.0",
+]
