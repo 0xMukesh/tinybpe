@@ -1,14 +1,10 @@
 [project]
-name = "cs336"
+name = "tinybpe"
 version = "0.1.0"
-description = "standford cs336"
+description = "a minimal implementation of efficient bpe"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "datasets>=4.8.5",
-    "numpy>=2.4.4",
-    "parallelbar>=2.5",
     "regex>=2026.4.4",
-    "torch>=2.11.0",
     "tqdm>=4.67.3",
 ]
