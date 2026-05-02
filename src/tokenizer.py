@@ -1,5 +1,6 @@
 import heapq
 import itertools
+import pickle
 from collections import Counter, defaultdict
 from enum import Enum
 from multiprocessing import Pool
@@ -16,50 +17,11 @@ GPT2_SPLIT_PATTERN = (
 )
 GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
-type _Token = int
-type _Pair = tuple[_Token, _Token]
-type _Seq = list[_Token]
-
-_worker_pattern = None
-_worker_special_tokens_pattern = None
-_worker_special_tokens = None
-
-
-def _init_worker(split_pattern: str, special_tokens_pattern: str, special_tokens: set):
-    global _worker_pattern, _worker_special_tokens_pattern, _worker_special_tokens
-    _worker_pattern = re.compile(split_pattern)
-    _worker_special_tokens_pattern = special_tokens_pattern
-    _worker_special_tokens = special_tokens
-
 
 def _iter_chunks(f: BinaryIO, chunk_boundaries: list[int]):
     for start, end in itertools.pairwise(chunk_boundaries):
         f.seek(start)
         yield f.read(end - start).decode()
-
-
-def _pretokenize(text: str):
-    pair_counts: Counter[_Pair] = Counter()
-    sequences: list[_Seq] = []
-
-    if (
-        _worker_pattern is None
-        or _worker_special_tokens_pattern is None
-        or _worker_special_tokens is None
-    ):
-        return []
-
-    for part in re.split(_worker_special_tokens_pattern, text):
-        if part in _worker_special_tokens:
-            continue
-        for m in re.findall(_worker_pattern, part):
-            ids = m.encode("utf-8")
-
-            sequences.append(ids)
-            for pair in zip(ids, ids[1:]):
-                pair_counts[pair] += 1
-
-    return list(pair_counts.items()), sequences
 
 
 class SplitPattern(Enum):
@@ -75,16 +37,33 @@ class Tokenizer:
     def __init__(
         self,
         split_pattern: SplitPattern,
-        special_tokens: dict[str, _Token],
+        special_tokens: dict[str, int],
     ) -> None:
-        self.merges: dict[_Pair, int] = defaultdict()
-        self.vocab: dict[_Token, bytes] = {idx: bytes([idx]) for idx in range(256)}
+        self.merges: dict[tuple[int, int], int] = defaultdict()
+        self.vocab: dict[int, bytes] = {idx: bytes([idx]) for idx in range(256)}
         self.special_tokens = special_tokens
         self.inverse_special_tokens = {v: k for k, v in special_tokens.items()}
         self.split_pattern = re.compile(split_pattern.regex)
         self.special_tokens_pattern = (
             "(" + "|".join(re.escape(k) for k in special_tokens) + ")"
         )
+
+    def _pretokenize(self, text: str):
+        pair_counts: Counter[tuple[int, int]] = Counter()
+        sequences: list[list[int]] = []
+
+        for part in re.split(self.special_tokens_pattern, text):
+            if part in self.special_tokens:
+                continue
+
+            for m in re.findall(self.split_pattern, part):
+                ids: list[int] = m.encode("utf-8")
+                sequences.append(ids)
+
+                for pair in itertools.pairwise(ids):
+                    pair_counts[pair] += 1
+
+        return list(pair_counts.items()), sequences
 
     def train(
         self,
@@ -108,34 +87,30 @@ class Tokenizer:
             else:
                 chunks = _iter_chunks(f, chunk_boundaries)
 
-            init_args = (
-                self.split_pattern,
-                self.special_tokens_pattern,
-                set(self.special_tokens),
-            )
-
-            pair_to_count: Counter[_Pair] = Counter()
-            seq_to_count: Counter[tuple[_Token, ...]] = Counter()  # for dedup
+            pair_to_count: Counter[tuple[int, int]] = Counter()
+            seq_to_count: Counter[tuple[int, ...]] = Counter()
 
             # parallel pretokenization
             with Pool(
-                processes=n_workers, initializer=_init_worker, initargs=init_args
+                processes=n_workers,
             ) as p:
-                for results in p.imap(_pretokenize, chunks, chunksize=2):
+                for results in p.imap(self._pretokenize, chunks, chunksize=2):
                     for pair, count in results[0]:
                         pair_to_count[pair] += count
 
                     for seq in results[1]:
                         seq_to_count[tuple(seq)] += 1
 
-        all_seqs = [list(seq) for seq in seq_to_count]
-        token_to_seq_ids: dict[_Token, set[int]] = defaultdict(set[int])
+        all_seqs = [list(seq) for seq in seq_to_count]  # deduped seqs
+        token_to_seq_ids: dict[int, set[int]] = defaultdict(set[int])  # inverse index
 
         for seq_id, seq in enumerate(all_seqs):
             for tok in seq:
                 token_to_seq_ids[tok].add(seq_id)
 
-        heap = [(-count, pair) for pair, count in pair_to_count.items()]
+        heap = [
+            (-count, pair) for pair, count in pair_to_count.items()
+        ]  # priority queue
         heapq.heapify(heap)
 
         for i in tqdm(range(vocab_size - 256)):
@@ -165,9 +140,10 @@ class Tokenizer:
                 freq = seq_to_count[tuple(seq)]
                 new_seq: list[int] = []
                 j = 0
+                n_seq = len(seq)
 
-                while j < len(seq):
-                    if j < len(seq) - 1 and seq[j] == a and seq[j + 1] == b:
+                while j < n_seq:
+                    if j < n_seq - 1 and seq[j] == a and seq[j + 1] == b:
                         if j > 0:
                             pair_to_count[(seq[j - 1], a)] -= freq
                             new_pair = (seq[j - 1], new_token_idx)
@@ -175,7 +151,7 @@ class Tokenizer:
 
                             # push the latest counts to the priority queue
                             heapq.heappush(heap, (-pair_to_count[new_pair], new_pair))
-                        if j < len(seq) - 2:
+                        if j < n_seq - 2:
                             pair_to_count[(b, seq[j + 2])] -= freq
                             new_pair = (new_token_idx, seq[j + 2])
                             pair_to_count[new_pair] += freq
@@ -195,3 +171,88 @@ class Tokenizer:
                 if b not in new_seq:
                     token_to_seq_ids[b].discard(seq_id)
                 token_to_seq_ids[new_token_idx].add(seq_id)
+
+    def _encode_bytes(self, text_bytes: bytes) -> list[int]:
+        tokens = list(text_bytes)
+        pair_to_count = Counter(itertools.pairwise(tokens))
+        heap: list[tuple[int | float, tuple[int, int]]] = [
+            (
+                self.merges.get(pair, float("inf")),
+                pair,
+            )  # start encoding by merge tokens with least token idx
+            for pair, _ in pair_to_count.items()
+        ]
+        heapq.heapify(heap)
+
+        while True:
+            if len(pair_to_count) == 0:
+                break
+
+            token_idx, to_merge = heapq.heappop(heap)
+            if token_idx == float("inf"):
+                break
+
+            token_idx = int(token_idx)
+
+            i, j = 0, 0
+            n_tokens = len(tokens)
+            new_tokens: list[int] = [0] * n_tokens
+
+            while i < n_tokens:
+                if (
+                    i < n_tokens - 1
+                    and tokens[i] == to_merge[0]
+                    and tokens[i + 1] == to_merge[1]
+                ):
+                    if i > 0:
+                        pair_to_count[(tokens[i - 1], tokens[i])] -= 1
+                        pair_to_count[(tokens[i - 1], token_idx)] += 1
+                    if i < n_tokens - 2:
+                        pair_to_count[(tokens[i], tokens[i + 2])] -= 1
+                        pair_to_count[(token_idx, tokens[i])] += 1
+
+                    new_tokens[j] = token_idx
+                    j += 1
+                    i += 2
+                else:
+                    new_tokens[j] = tokens[i]
+                    j += 1
+                    i += 1
+
+        return tokens
+
+    def encode(self, text: str) -> list[int]:
+        tokens: list[int] = []
+
+        for part in re.split(self.special_tokens_pattern, text):
+            if not part:
+                continue
+
+            if part in self.special_tokens:
+                tokens.append(self.special_tokens[part])
+            else:
+                for m in re.findall(self.split_pattern, part):
+                    tokens.extend(self._encode_bytes(m.encode("utf-8")))
+
+        return tokens
+
+    def decode(self, tokens: list[int]) -> str:
+        part_bytes: list[bytes] = []
+
+        for idx in tokens:
+            if idx in self.vocab:
+                part_bytes.append(self.vocab[idx])
+            elif idx in self.inverse_special_tokens:
+                part_bytes.append(self.inverse_special_tokens[idx].encode("utf-8"))
+
+        return b"".join(part_bytes).decode("utf-8")
+
+    def _save_state(self, path: str):
+        with open(path, "wb") as f:
+            pickle.dump({"merges": self.merges, "vocab": self.vocab}, f)
+
+    def _load_state(self, path: str):
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+            self.merges = data["merges"]
+            self.vocab = data["vocab"]
