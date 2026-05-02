@@ -21,7 +21,7 @@ GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1
 def _iter_chunks(f: BinaryIO, chunk_boundaries: list[int]):
     for start, end in itertools.pairwise(chunk_boundaries):
         f.seek(start)
-        yield f.read(end - start).decode()
+        yield f.read(end - start).decode("utf-8")
 
 
 class SplitPattern(Enum):
@@ -71,16 +71,18 @@ class Tokenizer:
         vocab_size: int,
         split_token: bytes,
         n_workers: int,
+        n_chunks_per_worker: int,
         use_imap_iter: bool = False,
     ):
         assert vocab_size >= 256
 
         with open(input_path, "rb") as f:
-            chunk_boundaries = find_chunk_boundaries(f, n_workers, split_token)
+            chunk_boundaries = find_chunk_boundaries(
+                f, n_workers * n_chunks_per_worker, split_token
+            )
 
             if not use_imap_iter:
                 chunks = []
-
                 for start, end in itertools.pairwise(chunk_boundaries):
                     f.seek(start)
                     chunks.append(f.read(end - start).decode("utf-8"))
@@ -94,7 +96,7 @@ class Tokenizer:
             with Pool(
                 processes=n_workers,
             ) as p:
-                for results in p.imap(self._pretokenize, chunks, chunksize=2):
+                for results in p.imap(self._pretokenize, chunks):
                     for pair, count in results[0]:
                         pair_to_count[pair] += count
 
